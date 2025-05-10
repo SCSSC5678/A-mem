@@ -1,16 +1,90 @@
 import unittest
-from memory_system import AgenticMemorySystem, MemoryNote
+# import warnings # No longer needed
+# warnings.simplefilter('always', DeprecationWarning) # No longer needed
+from ams import AgenticMemorySystem, MemoryNote # Reverted to direct import from ams
 from datetime import datetime
 import json
+from qdrant_client import QdrantClient # Added import
+import time # Added import
+import pytest # Added import
+import linecache # Added import
+import os # Added import
+
+# Pytest fixture to manage linecache for the problematic module
+@pytest.fixture(autouse=True, scope='session')
+def manage_line_cache_for_qdrant_retriever(request):
+    module_path = os.path.join(
+        os.path.dirname(__file__), # Gets directory of current test file
+        '..', # Go up one level to A-mem/
+        'mem_sys_pkg', 
+        'vector_stores', 
+        'qdrant_retriever.py'
+    )
+    module_path = os.path.normpath(module_path) # Normalize path
+
+    if os.path.exists(module_path):
+        # print(f"\nAttempting to manage linecache for: {module_path}")
+        linecache.clearcache()
+        # print(f"  linecache.clearcache() called.")
+        # Force a re-read of the specific line to confirm
+        fresh_line = linecache.getline(module_path, 174) # Line number from warning
+        # print(f"  Fresh line 174 from '{module_path}' after cache management: '{fresh_line.strip()}'")
+    # else:
+        # print(f"\n  Module path not found for linecache management: {module_path}")
+    yield
 
 class TestAgenticMemorySystem(unittest.TestCase):
     def setUp(self):
         """Set up test environment before each test."""
+        # Ensure a clean Qdrant collection before initializing AgenticMemorySystem
+        temp_client = QdrantClient(host="localhost", port=6333)
+        collection_name = "memories" # Same as used by AgenticMemorySystem's retriever
+
+        try:
+            temp_client.delete_collection(collection_name=collection_name)
+            # print(f"Attempted deletion of '{collection_name}' in setUp.")
+            
+            # Wait for the collection to be fully deleted
+            max_wait_time = 5  # seconds
+            wait_interval = 0.1 # seconds
+            elapsed_time = 0
+            while elapsed_time < max_wait_time:
+                try:
+                    temp_client.get_collection(collection_name=collection_name)
+                    # If get_collection succeeds, it means the collection still exists
+                    # print(f"Collection '{collection_name}' still exists, waiting...")
+                    time.sleep(wait_interval)
+                    elapsed_time += wait_interval
+                except Exception as e_get:
+                    # Expecting an error if collection is truly deleted (e.g., "not found")
+                    if "not found" in str(e_get).lower() or \
+                       (hasattr(e_get, 'status_code') and e_get.status_code == 404) or \
+                       (hasattr(e_get, 'code') and hasattr(e_get.code, 'value') and e_get.code().value == 5):
+                        # print(f"Collection '{collection_name}' confirmed deleted.")
+                        break 
+                    else:
+                        # Unexpected error during get_collection check
+                        # print(f"Warning: Unexpected error checking deletion status for '{collection_name}': {e_get}")
+                        time.sleep(wait_interval) # Still wait and retry
+                        elapsed_time += wait_interval
+            else:
+                # Timeout reached
+                print(f"Warning: Timeout waiting for collection '{collection_name}' to be deleted.")
+
+        except Exception as e_del:
+            # Ignore if initial delete_collection fails (e.g., collection didn't exist)
+            # print(f"Note: Could not delete '{collection_name}' collection in setUp (may not exist or other error): {e_del}")
+            pass
+        
+        # Now initialize the memory system. Its retriever will call _ensure_collection_exists.
         self.memory_system = AgenticMemorySystem(
             model_name='all-MiniLM-L6-v2',
             llm_backend="openai",
             llm_model="gpt-4o-mini"
+            # QdrantRetriever inside AgenticMemorySystem will use its own connection settings
         )
+        # The explicit call to self.memory_system.retriever._ensure_collection_exists() is no longer needed here,
+        # as it's handled during QdrantRetriever's initialization.
         
     def test_create_memory(self):
         """Test creating a new memory with complete metadata."""

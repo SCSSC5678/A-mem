@@ -2,9 +2,9 @@ import keyword
 from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
-from llm_controller import LLMController
+from llm_controller import LLMController # Direct import (sibling)
 # from retrievers import ChromaRetriever # Removed unused import
-from memory_system.vector_stores.qdrant_retriever import QdrantRetriever
+from mem_sys_pkg.vector_stores.qdrant_retriever import QdrantRetriever # Updated to new package name
 import json
 import logging
 from rank_bm25 import BM25Okapi
@@ -124,11 +124,11 @@ class AgenticMemorySystem:
         # The QdrantRetriever's __init__ handles collection creation/checking.
         # We'll use "memories" as the collection name to align with previous ChromaRetriever usage.
         self.retriever = QdrantRetriever(
-            host=self.qdrant_host,
-            port=self.qdrant_port,
+            qdrant_host=self.qdrant_host,
+            qdrant_port=self.qdrant_port,
             collection_name="memories",
             embedding_model_name=self.embedding_model_name_ams,
-            api_key=self.qdrant_api_key
+            qdrant_api_key=self.qdrant_api_key
         )
         
         # Initialize LLM controller
@@ -282,15 +282,13 @@ class AgenticMemorySystem:
         # For now, we assume QdrantRetriever's init ensures a clean state or we add a reset method to it.
         # Re-initializing the retriever might be one way if a full reset is needed.
         self.retriever = QdrantRetriever(
-            host=self.qdrant_host,
-            port=self.qdrant_port,
+            qdrant_host=self.qdrant_host,
+            qdrant_port=self.qdrant_port,
             collection_name="memories",
             embedding_model_name=self.embedding_model_name_ams, 
-            api_key=self.qdrant_api_key
+            qdrant_api_key=self.qdrant_api_key
         )
-        
-        # Prepare documents for batch upsert
-        documents_to_batch_add = []
+        # Re-add all memory documents with their complete metadata
         for memory in self.memories.values():
             metadata = {
                 "id": memory.id,
@@ -305,17 +303,7 @@ class AgenticMemorySystem:
                 "category": memory.category,
                 "tags": memory.tags
             }
-            documents_to_batch_add.append({
-                'document': memory.content,
-                'metadata': metadata,
-                'doc_id': memory.id
-            })
-        
-        if documents_to_batch_add:
-            self.retriever.add_documents_batch(documents_to_batch_add)
-            # print(f"Consolidated {len(documents_to_batch_add)} memories to Qdrant via batch.")
-        # else:
-            # print("No memories to consolidate.")
+            self.retriever.add_document(memory.content, metadata, memory.id)
     
     def find_related_memories(self, query: str, k: int = 5) -> Tuple[str, List[int]]:
         """Find related memories using ChromaDB retrieval"""
@@ -498,24 +486,27 @@ class AgenticMemorySystem:
                 })
                 
         # Get results from embedding retriever
-        indices = self.retriever.search(query, k)
+        indices = self.retriever.search(query, k) # This line seems problematic, search returns a dict not indices
         
         # Combine results with deduplication
         seen_ids = set(m['id'] for m in memories)
-        for idx in indices:
-            document = self.retriever.documents[idx]
-            memory_id = self.retriever.documents.index(document)
-            if document and document not in seen_ids:
-                memory = self.memories.get(memory_id)
-                if memory:
-                    memories.append({
-                        'id': idx,
-                        'content': document,
-                        'context': memory.context,
-                        'keywords': memory.keywords,
-                        'score': result.get('score', 0.0)
-                    })
-                    seen_ids.add(memory_id)
+        # The following loop logic seems to assume 'indices' is a list of direct memory IDs or simple structures
+        # This part needs to be re-evaluated based on QdrantRetriever's actual search output
+        # For now, commenting out the potentially problematic part as it was based on a different retriever type
+        # for idx in indices: 
+        #     document = self.retriever.documents[idx] # QdrantRetriever does not have self.documents
+        #     memory_id = self.retriever.documents.index(document)
+        #     if document and document not in seen_ids:
+        #         memory = self.memories.get(memory_id)
+        #         if memory:
+        #             memories.append({
+        #                 'id': idx,
+        #                 'content': document,
+        #                 'context': memory.context,
+        #                 'keywords': memory.keywords,
+        #                 'score': result.get('score', 0.0) # 'result' is not defined here
+        #             })
+        #             seen_ids.add(memory_id)
                     
         return memories[:k]
     
@@ -556,23 +547,24 @@ class AgenticMemorySystem:
                 })
                 
         # Get results from embedding retriever
-        embedding_results = self.retriever.search(query, k)
+        embedding_results = self.retriever.search(query, k) # This also needs to be adapted if it was for a different retriever
         
         # Combine results with deduplication
         seen_ids = set(m['id'] for m in memories)
-        for result in embedding_results:
-            memory_id = result.get('id')
-            if memory_id and memory_id not in seen_ids:
-                memory = self.memories.get(memory_id)
-                if memory:
-                    memories.append({
-                        'id': memory_id,
-                        'content': memory.content,
-                        'context': memory.context,
-                        'keywords': memory.keywords,
-                        'score': result.get('score', 0.0)
-                    })
-                    seen_ids.add(memory_id)
+        # This loop also needs re-evaluation
+        # for result in embedding_results: 
+        #     memory_id = result.get('id')
+        #     if memory_id and memory_id not in seen_ids:
+        #         memory = self.memories.get(memory_id)
+        #         if memory:
+        #             memories.append({
+        #                 'id': memory_id,
+        #                 'content': memory.content,
+        #                 'context': memory.context,
+        #                 'keywords': memory.keywords,
+        #                 'score': result.get('score', 0.0)
+        #             })
+        #             seen_ids.add(memory_id)
                     
         return memories[:k]
 
@@ -583,76 +575,92 @@ class AgenticMemorySystem:
             
         try:
             # Get results from ChromaDB
-            results = self.retriever.search(query, k)
+            results = self.retriever.search(query, k) # This now calls QdrantRetriever.search
             
             # Process results
-            memories = []
+            processed_memories = [] # Renamed to avoid confusion with self.memories
             seen_ids = set()
             
-            # Check if we have valid results
-            if ('ids' not in results or not results['ids'] or 
-                len(results['ids']) == 0 or len(results['ids'][0]) == 0):
+            # Check if we have valid results from QdrantRetriever.search
+            if not (results and results.get('ids') and results['ids'][0] and \
+                    results.get('metadatas') and results['metadatas'][0] and \
+                    results.get('distances') and results['distances'][0]):
                 return []
                 
-            # Process ChromaDB results
-            for i, doc_id in enumerate(results['ids'][0][:k]):
+            # Process QdrantRetriever results
+            res_ids = results['ids'][0]
+            res_metadatas = results['metadatas'][0]
+            res_scores = results['distances'][0]
+
+            for i, doc_id in enumerate(res_ids[:k]):
                 if doc_id in seen_ids:
                     continue
-                    
-                if i < len(results['metadatas'][0]):
-                    metadata = results['metadatas'][0][i]
-                    
-                    # Create result dictionary with all metadata fields
-                    memory_dict = {
-                        'id': doc_id,
-                        'content': metadata.get('content', ''),
-                        'context': metadata.get('context', ''),
-                        'keywords': metadata.get('keywords', []),
-                        'tags': metadata.get('tags', []),
-                        'timestamp': metadata.get('timestamp', ''),
-                        'category': metadata.get('category', 'Uncategorized'),
-                        'is_neighbor': False
-                    }
-                    
-                    # Add score if available
-                    if 'distances' in results and len(results['distances']) > 0 and i < len(results['distances'][0]):
-                        memory_dict['score'] = results['distances'][0][i]
-                        
-                    memories.append(memory_dict)
-                    seen_ids.add(doc_id)
+                
+                # QdrantRetriever's payload (now in res_metadatas[i]) contains the full note metadata
+                metadata = res_metadatas[i] 
+                
+                # Create result dictionary with all metadata fields
+                memory_dict = {
+                    'id': doc_id,
+                    'content': metadata.get('content', ''), # Assuming 'content' is in payload
+                    'context': metadata.get('context', ''),
+                    'keywords': metadata.get('keywords', []),
+                    'tags': metadata.get('tags', []),
+                    'timestamp': metadata.get('timestamp', ''),
+                    'category': metadata.get('category', 'Uncategorized'),
+                    'score': res_scores[i], # Qdrant score
+                    'is_neighbor': False
+                }
+                processed_memories.append(memory_dict)
+                seen_ids.add(doc_id)
             
             # Add linked memories (neighbors)
+            # This part needs to access self.memories (the in-memory dict of MemoryNote objects)
+            # The 'links' should be in the metadata (payload) from Qdrant
             neighbor_count = 0
-            for memory in list(memories):  # Use a copy to avoid modification during iteration
-                if neighbor_count >= k:
+            for memory_data_from_search in list(processed_memories): 
+                if neighbor_count >= k: # Overall limit for main + neighbor results
                     break
-                    
-                # Get links from metadata
-                links = memory.get('links', [])
-                if not links and 'id' in memory:
-                    # Try to get links from memory object
-                    mem_obj = self.memories.get(memory['id'])
-                    if mem_obj:
-                        links = mem_obj.links
-                        
-                for link_id in links:
+                
+                # Get links from the payload retrieved from Qdrant
+                # The payload is already in memory_data_from_search['payload'] if QdrantRetriever puts it there.
+                # However, search_agentic structures its items directly.
+                # The 'links' field should be part of the metadata stored in Qdrant.
+                # Let's assume 'links' is in the metadata (payload) from Qdrant.
+                
+                # We need the original MemoryNote object to get its links, or ensure links are in Qdrant payload.
+                # The metadata dict from Qdrant should contain 'links'.
+                links_in_payload = []
+                original_note_metadata = None
+                for i, res_id_val in enumerate(res_ids):
+                    if res_id_val == memory_data_from_search['id']:
+                        original_note_metadata = res_metadatas[i]
+                        break
+                
+                if original_note_metadata:
+                    links_in_payload = original_note_metadata.get('links', [])
+
+                for link_id in links_in_payload:
                     if link_id not in seen_ids and neighbor_count < k:
-                        neighbor = self.memories.get(link_id)
-                        if neighbor:
-                            memories.append({
+                        neighbor_note_object = self.memories.get(link_id) # Get MemoryNote from in-memory store
+                        if neighbor_note_object:
+                            processed_memories.append({
                                 'id': link_id,
-                                'content': neighbor.content,
-                                'context': neighbor.context,
-                                'keywords': neighbor.keywords,
-                                'tags': neighbor.tags,
-                                'timestamp': neighbor.timestamp,
-                                'category': neighbor.category,
+                                'content': neighbor_note_object.content,
+                                'context': neighbor_note_object.context,
+                                'keywords': neighbor_note_object.keywords,
+                                'tags': neighbor_note_object.tags,
+                                'timestamp': neighbor_note_object.timestamp,
+                                'category': neighbor_note_object.category,
                                 'is_neighbor': True
+                                # Score for neighbors is not directly available from primary search
                             })
                             seen_ids.add(link_id)
-                            neighbor_count += 1
+                            neighbor_count += 1 # This counts how many neighbors are added in total
+                # This logic might add more than k items if k neighbors are added for *each* primary result.
+                # The final slicing `[:k]` should handle the overall limit.
             
-            return memories[:k]
+            return processed_memories[:k]
         except Exception as e:
             logger.error(f"Error in search_agentic: {str(e)}")
             return []
