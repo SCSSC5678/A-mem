@@ -7,6 +7,7 @@ from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import uuid # For generating note IDs if not provided or for Qdrant point IDs if needed
 from typing import List, Dict, Any, Optional, Union
+import time # Added import
 
 class QdrantRetriever:
     """
@@ -64,22 +65,30 @@ class QdrantRetriever:
 
         self._ensure_collection_exists()
 
-    def _ensure_collection_exists(self):
+    def _ensure_collection_exists(self, m_value: Optional[int] = None, ef_construct_value: Optional[int] = None):
         """
         Ensures that the Qdrant collection exists and is configured correctly.
         It creates the collection only if it does not already exist.
-        The test's setUp method is responsible for deleting the collection for a clean state.
+        Optionally accepts HNSW configuration parameters for collection creation.
+
+        Args:
+            m_value (Optional[int]): HNSW M parameter (number of connections).
+            ef_construct_value (Optional[int]): HNSW ef_construct parameter (construction beam size).
         """
+        hnsw_config_diff = None
+        if m_value is not None and ef_construct_value is not None:
+            hnsw_config_diff = models.HnswConfigDiff(m=m_value, ef_construct=ef_construct_value)
+        elif m_value is not None or ef_construct_value is not None:
+            print(f"Warning: Only one of m_value ({m_value}) or ef_construct_value ({ef_construct_value}) was provided. "
+                  f"Both are needed to customize HNSW config. Proceeding without custom HNSW config.")
+
         try:
-            # Attempt to get collection info. If it succeeds, the collection exists.
             self.client.get_collection(collection_name=self.collection_name)
-            # print(f"Collection '{self.collection_name}' already exists. No action needed by _ensure_collection_exists.")
+            # If collection exists, this method currently does not modify it, even if HNSW params are different.
+            # The benchmarking script should handle deletion and recreation if specific HNSW params are required for a run.
+            # print(f"Collection '{self.collection_name}' already exists.")
         except Exception as e:
             # Check if the exception indicates the collection was not found
-            # This condition might need to be adjusted based on the exact error qdrant_client throws
-            # for a non-existent collection (e.g., a specific error type or status code in the error message).
-            # A common pattern is an RPC error with status code 5 (NOT_FOUND) or a message containing "not found".
-            # For qdrant_client, a `UnexpectedResponse` with status 404 or similar gRPC error.
             if "not found" in str(e).lower() or \
                (hasattr(e, 'status_code') and e.status_code == 404) or \
                (hasattr(e, 'code') and hasattr(e.code, 'value') and e.code().value == 5): # gRPC StatusCode.NOT_FOUND
@@ -93,17 +102,37 @@ class QdrantRetriever:
                             distance=models.Distance.COSINE
                         ),
                         on_disk_payload=self.on_disk_payload,
+                        hnsw_config=hnsw_config_diff # Pass HNSW config here
                     )
-                    # print(f"Collection '{self.collection_name}' created successfully.")
+                    # print(f"Collection '{self.collection_name}' created successfully with HNSW: {hnsw_config_diff}.")
                 except Exception as creation_e:
-                    print(f"Error creating collection '{self.collection_name}' after it was deemed non-existent: {creation_e}")
-                    raise  # Re-raise the creation error
+                    if "collection data already exists" in str(creation_e).lower():
+                        # print(f"Attempting to re-create '{self.collection_name}' due to existing data on disk.")
+                        try:
+                            self.client.delete_collection(collection_name=self.collection_name)
+                            time.sleep(0.5) 
+                            self.client.create_collection(
+                                collection_name=self.collection_name,
+                                vectors_config=models.VectorParams(
+                                    size=self.embedding_dimension,
+                                    distance=models.Distance.COSINE
+                                ),
+                                on_disk_payload=self.on_disk_payload,
+                                hnsw_config=hnsw_config_diff # And here
+                            )
+                            # print(f"Collection '{self.collection_name}' re-created successfully with HNSW: {hnsw_config_diff} after clearing existing data.")
+                        except Exception as recreate_e:
+                            print(f"Error re-creating collection '{self.collection_name}': {recreate_e}")
+                            raise recreate_e
+                    else:
+                        print(f"Error creating collection '{self.collection_name}' after it was deemed non-existent: {creation_e}")
+                        raise creation_e
             else:
                 # An unexpected error occurred while trying to get collection info
                 print(f"Unexpected error when checking existence of collection '{self.collection_name}': {e}")
-                raise # Re-raise the unexpected error
+                raise
     
-    def add_document(self, document: str, metadata: dict, doc_id: Optional[str] = None): # Matched AgenticMemorySystem's call
+    def add_document(self, document: str, metadata: dict, doc_id: Optional[str] = None, vector: Optional[List[float]] = None): # Matched AgenticMemorySystem's call
         """
         Adds a document (embedding and payload) to the Qdrant collection.
         This method name matches what AgenticMemorySystem.add_note calls on its retriever.
@@ -111,30 +140,35 @@ class QdrantRetriever:
 
         Args:
             document (str): The textual content of the note to be embedded.
-            metadata (Dict[str, Any]): Metadata associated with the A-Mem note. 
-                                      This should include all A-Mem note attributes such as 
-                                      'content', 'semantic_context', 'tags', 'keywords', 
-                                      'creation_timestamp', 'last_access_timestamp', 
-                                      'retrieval_count', and importantly, 'related_memory_ids' 
+            metadata (Dict[str, Any]): Metadata associated with the A-Mem note.
+                                      This should include all A-Mem note attributes such as
+                                      'content', 'semantic_context', 'tags', 'keywords',
+                                      'creation_timestamp', 'last_access_timestamp',
+                                      'retrieval_count', and importantly, 'related_memory_ids'
                                       (a list of strings) if inter-note links are to be stored.
             doc_id (Optional[str]): Unique identifier for the note.
+            vector (Optional[List[float]]): Optional pre-computed embedding vector. If provided,
+                                            the document will not be embedded by this method.
         """
         if doc_id is None:
             doc_id = str(uuid.uuid4())
 
         try:
-            vector = self.embedding_model.encode(document).tolist()
-            
+            if vector is None:
+                vector = self.embedding_model.encode(document).tolist()
+            # else: use provided vector
+
             point = models.PointStruct(
-                id=doc_id, 
+                id=doc_id,
                 vector=vector,
                 payload=metadata # metadata from AgenticMemorySystem is the payload
             )
-            
+            print(f"[QDRANT_ADD] ID: {doc_id}, Content Snippet: {document[:100]}...") # ADDED LOGGING
+
             self.client.upsert(
                 collection_name=self.collection_name,
                 points=[point],
-                wait=True 
+                wait=True
             )
             # print(f"Document '{doc_id}' added/updated in collection '{self.collection_name}'.")
         except Exception as e:
@@ -165,69 +199,46 @@ class QdrantRetriever:
         """
         try:
             query_vector = self.embedding_model.encode(query_text).tolist()
+            print(f"[QDRANT_SEARCH] Query Text: {query_text[:100]}...") # ADDED LOGGING
             
-            # Note: client.search is deprecated. Using client.query_points (or client.query if that's the final name)
-            # For qdrant-client >= 1.7.0, `search` is a simplified version of `query`.
-            # The direct replacement for more complex queries or to be future-proof is `query`.
-            # However, the parameters used here (query_vector, query_filter, limit, with_payload)
-            # are directly compatible with `search`'s signature and also with `query` if structured correctly.
-            # Given the deprecation warning, it's safer to assume `query` or `query_points` is preferred.
-            # Let's assume `search` is still functional but we're preparing for its removal.
-            # The user mentioned `query_points` as the replacement.
-            # The `search` method in qdrant-client is often a wrapper.
-            # The warning clearly states "Use `query_points` instead."
-            # Context7 examples for `query_points` show using `query` as the parameter name for the vector.
+            search_params = models.SearchParams(hnsw_ef=128, exact=True) # Explicitly set search-time HNSW ef, force exact
+
             search_results = self.client.query_points(
                 collection_name=self.collection_name,
-                query=query_vector,       # Corrected from query_vector to query
+                query=query_vector,
                 query_filter=filters,
                 limit=k,
-                with_payload=True
+                with_payload=True,
+                search_params=search_params
             )
-            # Note: The parameter names for `query_points` might differ slightly.
-            # Common parameters for search-like methods in Qdrant are `vector` (for the query vector itself)
-            # and `filter` (for the filter object). `with_payload` is also common.
-            # If `query_points` has different parameter names, this will need adjustment.
-            # For now, assuming direct mapping from `search`/`query` parameters.
-            
-            # The search_results is a QueryResponse object.
-            # The actual list of points is likely in an attribute like 'points' or 'hits'.
-            # Let's assume 'points' first, as it's common.
-            # If this fails, 'hits' would be the next common attribute name.
             
             actual_points_list = []
             if hasattr(search_results, 'points') and search_results.points is not None:
                 actual_points_list = search_results.points
-            elif hasattr(search_results, 'hits') and search_results.hits is not None: # Fallback if .points doesn't exist or is None
+            elif hasattr(search_results, 'hits') and search_results.hits is not None: 
                 actual_points_list = search_results.hits
-            # else:
-                # print(f"DEBUG: QueryResponse object does not have 'points' or 'hits' attribute, or they are None.")
-                # print(f"DEBUG: dir(search_results): {dir(search_results)}")
-
+            
+            print(f"[QDRANT_SEARCH_RAW_RESULTS] For query '{query_text[:50]}...': {actual_points_list[:5]}") # ADDED LOGGING (log first 5 raw results)
 
             results_ids: List[str] = []
             results_payloads: List[Dict[str, Any]] = []
             results_scores: List[float] = []
 
-            # Process the items in actual_points_list
-            # This logic is based on the user's report to handle ScoredPoint or tuple results.
-            if actual_points_list: # Check if the list is not empty
-                # Introspect the first item to decide processing strategy (heuristic)
+            if actual_points_list: 
                 first_item = actual_points_list[0]
-                if hasattr(first_item, 'id') and hasattr(first_item, 'score'): # Likely ScoredPoint
+                if hasattr(first_item, 'id') and hasattr(first_item, 'score'): 
                     for point_data in actual_points_list:
-                        if hasattr(point_data, 'id') and hasattr(point_data, 'score'): # Double check each item
+                        if hasattr(point_data, 'id') and hasattr(point_data, 'score'): 
                             results_ids.append(str(point_data.id))
                             results_payloads.append(point_data.payload if point_data.payload is not None else {})
                             results_scores.append(point_data.score)
                         else:
                             print(f"Warning: Mixed item types in search results. Expected ScoredPoint-like, got {type(point_data)}: {point_data}")
-                elif isinstance(first_item, tuple): # Likely a list of tuples
+                elif isinstance(first_item, tuple): 
                     for point_tuple in actual_points_list:
-                        if isinstance(point_tuple, tuple) and len(point_tuple) >= 2: # Expecting at least (id, score)
+                        if isinstance(point_tuple, tuple) and len(point_tuple) >= 2: 
                             point_id = point_tuple[0]
                             point_score = point_tuple[1]
-                            # Assuming payload is the third element if present
                             point_payload = point_tuple[2] if len(point_tuple) > 2 and point_tuple[2] is not None else {}
                             
                             results_ids.append(str(point_id))
@@ -237,18 +248,14 @@ class QdrantRetriever:
                             print(f"Warning: Malformed or unexpected tuple in search results: {point_tuple}")
                 else:
                     print(f"Warning: Unexpected item type in search results list. First item type: {type(first_item)}")
-            # else:
-                # print("DEBUG: actual_points_list is empty.")
             
             return {
                 "ids": [results_ids],
                 "metadatas": [results_payloads],
-                "distances": [results_scores]  # Using Qdrant scores (similarity) for 'distances' key
+                "distances": [results_scores]
             }
         except Exception as e:
-            # Log error or raise a custom exception
             print(f"Error searching in Qdrant: {e}")
-            # Return empty structure in case of error to avoid breaking AgenticMemorySystem
             return {"ids": [[]], "metadatas": [[]], "distances": [[]]}
 
     def delete_document(self, doc_id: str): # Matched AgenticMemorySystem's call
@@ -265,8 +272,6 @@ class QdrantRetriever:
             # print(f"Document '{doc_id}' deleted from collection '{self.collection_name}'.")
         except Exception as e:
             print(f"Error deleting document '{doc_id}' from Qdrant: {e}")
-            # Decide if to raise or just log, depending on desired error handling
-            # For now, just printing, but A-Mem might expect an exception or boolean.
 
     def add_documents_batch(self, documents_data: List[Dict[str, Any]]):
         """
@@ -274,21 +279,27 @@ class QdrantRetriever:
 
         Args:
             documents_data (List[Dict[str, Any]]): A list of dictionaries, where each dictionary
-                                                 contains 'document' (str), 'metadata' (dict), 
-                                                 and 'doc_id' (str) for a note.
+                                                 contains 'document' (str), 'metadata' (dict),
+                                                 'doc_id' (str), and optionally 'vector' (List[float])
+                                                 for a note.
         """
         points_to_upsert = []
         for item in documents_data:
             doc_content = item.get('document')
             metadata = item.get('metadata')
             doc_id = item.get('doc_id')
+            vector = item.get('vector') # Get optional pre-computed vector
 
             if not all([doc_content, metadata, doc_id]):
                 print(f"Warning: Skipping item in batch due to missing data: {item}")
                 continue
 
             try:
-                vector = self.embedding_model.encode(doc_content).tolist()
+                if vector is None:
+                    # If no vector is provided, encode the document
+                    vector = self.embedding_model.encode(doc_content).tolist()
+                # else: use provided vector
+
                 point = models.PointStruct(
                     id=doc_id,
                     vector=vector,
@@ -297,9 +308,8 @@ class QdrantRetriever:
                 points_to_upsert.append(point)
             except Exception as e:
                 print(f"Error processing document '{doc_id}' for batch add: {e}")
-                # Optionally, decide whether to skip this point or halt the batch
                 continue
-        
+
         if not points_to_upsert:
             # print("No valid points to upsert in the batch.")
             return
@@ -313,7 +323,6 @@ class QdrantRetriever:
             # print(f"Successfully upserted {len(points_to_upsert)} documents in a batch.")
         except Exception as e:
             print(f"Error upserting batch of documents to Qdrant: {e}")
-            # Consider how to handle partial failures if Qdrant supports it, or if to re-raise
             raise
 
 
@@ -331,8 +340,8 @@ if __name__ == '__main__':
         sample_note_id = str(uuid.uuid4())
         sample_text = "This is a test note about Qdrant and A-Mem integration."
         sample_payload = {
-            "a_mem_note_id": sample_note_id, # Storing original A-Mem ID in payload
-            "content": sample_text, # Storing content also in payload for easy access by A-Mem
+            "a_mem_note_id": sample_note_id, 
+            "content": sample_text, 
             "semantic_context": "A test context.",
             "tags": ["test", "qdrant", "a-mem"],
             "keywords": ["qdrant", "retriever"],
@@ -341,7 +350,6 @@ if __name__ == '__main__':
             "retrieval_count": 0,
             "related_memory_ids": []
         }
-        # AgenticMemorySystem calls add_document(content, metadata, id)
         retriever.add_document(document=sample_text, metadata=sample_payload, doc_id=sample_note_id)
         print(f"Added note: {sample_note_id}")
 
@@ -357,7 +365,7 @@ if __name__ == '__main__':
             "creation_timestamp": "2025-05-09T12:01:00Z",
             "last_access_timestamp": "2025-05-09T12:01:00Z",
             "retrieval_count": 0,
-            "related_memory_ids": [sample_note_id] # Link to the first note
+            "related_memory_ids": [sample_note_id] 
         }
         retriever.add_document(document=sample_text_2, metadata=sample_payload_2, doc_id=sample_note_id_2)
         print(f"Added note: {sample_note_id_2}")
@@ -365,11 +373,9 @@ if __name__ == '__main__':
 
         # Example: Search for notes using the new 'search' method
         query = "Tell me about Qdrant"
-        # AgenticMemorySystem calls search(query, k)
         results = retriever.search(query_text=query, k=5) 
         print(f"\nSearch results for '{query}':")
         
-        # Assuming the structure AgenticMemorySystem expects:
         if results and results["ids"] and results["ids"][0]:
             for i in range(len(results["ids"][0])):
                 res_id = results["ids"][0][i]

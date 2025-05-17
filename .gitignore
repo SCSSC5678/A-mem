@@ -18,3 +18,12 @@ __pycache__/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Sensitive Configuration
+.env
+
+# Untracked Benchmarking/Testing Files
+benchmarking_guide.md
+run_baseline_tests.py
+test_evolution_benchmarks.py
+test_orchestrator_benchmark.py

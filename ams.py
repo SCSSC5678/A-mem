@@ -2,25 +2,18 @@ import keyword
 from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
-from llm_controller import LLMController # Direct import (sibling)
-# from retrievers import ChromaRetriever # Removed unused import
-from mem_sys_pkg.vector_stores.qdrant_retriever import QdrantRetriever # Updated to new package name
 import json
 import logging
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 import os
-from abc import ABC, abstractmethod
-from transformers import AutoModel, AutoTokenizer
-from nltk.tokenize import word_tokenize
-import pickle
 from pathlib import Path
-from litellm import completion
-import time
 
+# Configure logging
 logger = logging.getLogger(__name__)
+
+from qdrant_client import models as qdrant_models # Moved import to module level
+from sentence_transformers import SentenceTransformer # Moved import to module level
+from qdrant_client import QdrantClient # Moved import to module level
+
 
 class MemoryNote:
     """A memory note that represents a single unit of information in the memory system.
@@ -81,6 +74,162 @@ class MemoryNote:
         self.retrieval_count = retrieval_count or 0
         self.evolution_history = evolution_history or []
 
+class QdrantRetriever:
+    """Retriever for Qdrant vector database.
+    
+    This class provides methods for adding, retrieving, and deleting documents from Qdrant.
+    """
+    
+    def __init__(self, 
+                 qdrant_host: str = "localhost",
+                 qdrant_port: int = 6333,
+                 collection_name: str = "memories",
+                 embedding_model_name: str = "all-MiniLM-L6-v2",
+                 qdrant_api_key: Optional[str] = None):
+        """Initialize the QdrantRetriever.
+        
+        Args:
+            qdrant_host (str): Host for Qdrant service
+            qdrant_port (int): Port for Qdrant service
+            collection_name (str): Name of the Qdrant collection to use
+            embedding_model_name (str): Name of the embedding model to use
+            qdrant_api_key (Optional[str]): API key for Qdrant service (if secured)
+        """
+        self.qdrant_host = qdrant_host
+        self.qdrant_port = qdrant_port
+        self.collection_name = collection_name
+        self.embedding_model_name = embedding_model_name
+        self.qdrant_api_key = qdrant_api_key
+        
+        # Imports moved to module level
+
+        self.client = QdrantClient(host=qdrant_host, port=qdrant_port, api_key=qdrant_api_key, prefer_grpc=False) # prefer_grpc=False for wider compatibility
+        self.embedding_model = SentenceTransformer(embedding_model_name)
+        self.vector_size = self.embedding_model.get_sentence_embedding_dimension()
+
+        # Ensure collection exists
+        try:
+            self.client.get_collection(collection_name=self.collection_name)
+            logger.info(f"Qdrant collection '{self.collection_name}' already exists.")
+        except Exception as e:
+            if "not found" in str(e).lower() or "status_code=404" in str(e).lower():
+                logger.info(f"Qdrant collection '{self.collection_name}' not found. Creating now...")
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=qdrant_models.VectorParams(size=self.vector_size, distance=qdrant_models.Distance.COSINE)
+                )
+                logger.info(f"Qdrant collection '{self.collection_name}' created successfully with vector size {self.vector_size}.")
+            else:
+                logger.error(f"Error checking Qdrant collection '{self.collection_name}': {e}")
+                raise
+        
+    def _get_embedding(self, text: str) -> List[float]:
+        """Generate embedding for a text."""
+        return self.embedding_model.encode(text).tolist()
+
+    def add_document(self, document: str, metadata: Dict[str, Any], doc_id: str, vector: Optional[List[float]] = None):
+        """Add a document to Qdrant.
+        
+        Args:
+            document (str): The document text (used if vector is not provided).
+            metadata (Dict[str, Any]): Payload for the document.
+            doc_id (str): ID for the document.
+            vector (Optional[List[float]]): Pre-computed embedding vector.
+        """
+        if vector is None:
+            vector = self._get_embedding(document) # Embed the 'document' field if no vector given
+        
+        point = qdrant_models.PointStruct(
+            id=doc_id,
+            vector=vector,
+            payload=metadata # The entire metadata dict becomes the payload
+        )
+        self.client.upsert(collection_name=self.collection_name, points=[point]) # Changed to upsert
+        logger.debug(f"Upserted document with ID '{doc_id}' to Qdrant collection '{self.collection_name}'.")
+        
+    def add_documents_batch(self, documents_data: List[Dict[str, Any]]):
+        """Add multiple documents to Qdrant in a batch.
+        
+        Args:
+            documents_data (List[Dict[str, Any]]): List of document data. Each dict should have
+                                                 'doc_id', 'document' (text for embedding if no vector),
+                                                 'metadata' (payload), and optionally 'vector'.
+        """
+        points_batch = []
+        for doc_data in documents_data:
+            doc_id = doc_data['doc_id']
+            document_text = doc_data['document']
+            metadata = doc_data['metadata']
+            vector = doc_data.get('vector')
+
+            if vector is None:
+                vector = self._get_embedding(document_text)
+            
+            points_batch.append(qdrant_models.PointStruct(
+                id=doc_id,
+                vector=vector,
+                payload=metadata
+            ))
+        
+        if points_batch:
+            self.client.upsert(collection_name=self.collection_name, points=points_batch) # Changed to upsert
+            logger.debug(f"Upserted batch of {len(points_batch)} documents to Qdrant collection '{self.collection_name}'.")
+            
+    def delete_document(self, doc_id: str):
+        """Delete a document from Qdrant.
+        
+        Args:
+            doc_id (str): ID of the document to delete.
+        """
+        self.client.delete( # Changed to delete
+            collection_name=self.collection_name,
+            points_selector=qdrant_models.PointIdsList(points=[doc_id])
+        )
+        logger.debug(f"Deleted document with ID '{doc_id}' from Qdrant collection '{self.collection_name}'.")
+            
+    def search(self, query_text: Optional[str] = None, query_vector: Optional[List[float]] = None, k: int = 5, filters: Optional[qdrant_models.Filter] = None) -> List[Dict[str, Any]]:
+        """Search for documents in Qdrant.
+        
+        Args:
+            query_text (Optional[str]): The query text. If provided, it will be embedded.
+            query_vector (Optional[List[float]]): A pre-computed query vector.
+                                                 One of query_text or query_vector must be provided.
+            k (int): Number of results to return.
+            filters (Optional[qdrant_models.Filter]): Qdrant filter conditions.
+            
+        Returns:
+            List[Dict[str, Any]]: A list of search results, where each result is a dictionary
+                                  containing 'id', 'score', and 'payload'.
+        """
+        if query_vector is None:
+            if query_text is None:
+                raise ValueError("Either query_text or query_vector must be provided for search.")
+            query_vector = self._get_embedding(query_text)
+
+        # Use query_points instead of search
+        # query_points returns a list of ScoredPoint objects directly
+        # The `query` parameter in query_points is for the vector
+        scored_points = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_vector, # Renamed from query_vector
+            query_filter=filters,
+            limit=k,
+            with_payload=True
+            # with_vector is not a direct parameter for query_points
+            # By default, query_points may not return vectors unless specifically requested
+            # or if using a vector selector. For our current use, not requesting vectors is fine.
+        ).points # Access the .points attribute from QueryResponse
+        
+        # Transform ScoredPoint results into a list of dictionaries
+        processed_results = []
+        for scored_point in scored_points: # Iterate over the list of ScoredPoint
+            processed_results.append({
+                "id": scored_point.id,
+                "score": scored_point.score,
+                "payload": scored_point.payload
+            })
+        return processed_results
+
 class AgenticMemorySystem:
     """Core memory system that manages memory notes and their evolution.
     
@@ -97,9 +246,10 @@ class AgenticMemorySystem:
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
                  api_key: Optional[str] = None,
-                 qdrant_host: str = "localhost",      # Added Qdrant params
-                 qdrant_port: int = 6333,          # Added Qdrant params
-                 qdrant_api_key: Optional[str] = None): # Added Qdrant params
+                 qdrant_host: str = "localhost",
+                 qdrant_port: int = 6333,
+                 qdrant_api_key: Optional[str] = None,
+                 collection_name: str = "memories"):
         """Initialize the memory system.
         
         Args:
@@ -111,6 +261,7 @@ class AgenticMemorySystem:
             qdrant_host: Host for Qdrant service
             qdrant_port: Port for Qdrant service
             qdrant_api_key: API key for Qdrant service (if secured)
+            collection_name: Name of the Qdrant collection to use
         """
         self.memories = {}
         
@@ -118,64 +269,26 @@ class AgenticMemorySystem:
         self.qdrant_host = qdrant_host
         self.qdrant_port = qdrant_port
         self.qdrant_api_key = qdrant_api_key
-        self.embedding_model_name_ams = model_name # Store embedding model name for AMS
+        self.embedding_model_name_ams = model_name
+        self.collection_name = collection_name
 
         # Initialize QdrantRetriever
-        # The QdrantRetriever's __init__ handles collection creation/checking.
-        # We'll use "memories" as the collection name to align with previous ChromaRetriever usage.
         self.retriever = QdrantRetriever(
             qdrant_host=self.qdrant_host,
             qdrant_port=self.qdrant_port,
-            collection_name="memories",
+            collection_name=self.collection_name,
             embedding_model_name=self.embedding_model_name_ams,
             qdrant_api_key=self.qdrant_api_key
         )
         
-        # Initialize LLM controller
-        self.llm_controller = LLMController(llm_backend, llm_model, api_key)
+        # Mock LLM controller for PoC
+        self.llm_controller = type('MockLLMController', (), {'llm': type('MockLLM', (), {'get_completion': lambda *args, **kwargs: json.dumps({"keywords": [], "context": "General", "tags": []})})()})()
+        
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
-
-        # Evolution system prompt
-        self._evolution_system_prompt = '''
-                                You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
-                                Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.
-                                Make decisions about its evolution.  
-
-                                The new memory context:
-                                {context}
-                                content: {content}
-                                keywords: {keywords}
-
-                                The nearest neighbors memories:
-                                {nearest_neighbors_memories}
-
-                                Based on this information, determine:
-                                1. Should this memory be evolved? Consider its relationships with other memories.
-                                2. What specific actions should be taken (strengthen, update_neighbor)?
-                                   2.1 If choose to strengthen the connection, which memory should it be connected to? Can you give the updated tags of this memory?
-                                   2.2 If choose to update_neighbor, you can update the context and tags of these memories based on the understanding of these memories. If the context and the tags are not updated, the new context and tags should be the same as the original ones. Generate the new context and tags in the sequential order of the input neighbors.
-                                Tags should be determined by the content of these characteristic of these memories, which can be used to retrieve them later and categorize them.
-                                Note that the length of new_tags_neighborhood must equal the number of input neighbors, and the length of new_context_neighborhood must equal the number of input neighbors.
-                                The number of neighbors is {neighbor_number}.
-                                Return your decision in JSON format with the following structure:
-                                {{
-                                    "should_evolve": True or False,
-                                    "actions": ["strengthen", "update_neighbor"],
-                                    "suggested_connections": ["neighbor_memory_ids"],
-                                    "tags_to_update": ["tag_1",..."tag_n"], 
-                                    "new_context_neighborhood": ["new context",...,"new context"],
-                                    "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]],
-                                }}
-                                '''
         
     def analyze_content(self, content: str) -> Dict:            
         """Analyze content using LLM to extract semantic metadata.
-        
-        Uses a language model to understand the content and extract:
-        - Keywords: Important terms and concepts
-        - Context: Overall domain or theme
-        - Tags: Classification categories
         
         Args:
             content (str): The text content to analyze
@@ -186,109 +299,177 @@ class AgenticMemorySystem:
                 - context: str
                 - tags: List[str]
         """
-        prompt = """Generate a structured analysis of the following content by:
-            1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
-            2. Extracting core themes and contextual elements
-            3. Creating relevant categorical tags
+        # Mock implementation for PoC
+        return {"keywords": [], "context": "General", "tags": []}
 
-            Format the response as a JSON object:
-            {
-                "keywords": [
-                    // several specific, distinct keywords that capture key concepts and terminology
-                    // Order from most to least important
-                    // Don't include keywords that are the name of the speaker or time
-                    // At least three keywords, but don't be too redundant.
-                ],
-                "context": 
-                    // one sentence summarizing:
-                    // - Main topic/domain
-                    // - Key arguments/points
-                    // - Intended audience/purpose
-                ,
-                "tags": [
-                    // several broad categories/themes for classification
-                    // Include domain, format, and type tags
-                    // At least three tags, but don't be too redundant.
-                ]
-            }
+    def add_note(self, content: str, time: str = None, vector: Optional[List[float]] = None, **kwargs) -> str:
+        """Add a new memory note.
 
-            Content for analysis:
-            """ + content
-        try:
-            response = self.llm_controller.llm.get_completion(prompt, response_format={"type": "json_schema", "json_schema": {
-                        "name": "response",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "keywords": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "context": {
-                                    "type": "string",
-                                },
-                                "tags": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                }
-                            }
-                        }
-                    }})
-            return json.loads(response)
-        except Exception as e:
-            print(f"Error analyzing content: {e}")
-            return {"keywords": [], "context": "General", "tags": []}
+        Args:
+            content (str): The main text content of the memory.
+            time (str, optional): Creation time in format YYYYMMDDHHMM. Defaults to None.
+            vector (Optional[List[float]], optional): Optional pre-computed embedding vector.
+                                                      If provided, the content will not be embedded
+                                                      by the retriever. Defaults to None.
+            **kwargs: Additional fields for the MemoryNote.
 
-    def add_note(self, content: str, time: str = None, **kwargs) -> str:
-        """Add a new memory note"""
-        # Create MemoryNote without llm_controller
+        Returns:
+            str: The ID of the newly added memory note.
+        """
+        # Create MemoryNote
         if time is not None:
             kwargs['timestamp'] = time
         note = MemoryNote(content=content, **kwargs)
-        
-        # Update retriever with all documents
+
+        # Process memory for potential evolution (this might update note metadata)
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        
-        # Add to ChromaDB with complete metadata
-        metadata = {
-            "id": note.id,
-            "content": note.content,
+
+        # Prepare a rich payload for Qdrant, aligning with STP Table 2
+        # The 'document' field for embedding is note.content
+        # The payload should contain all other structured attributes.
+        qdrant_payload = {
+            "note_id": note.id, # Store note.id in payload for easier reference
+            "content_text": note.content, # Store original content text
             "keywords": note.keywords,
-            "links": note.links,
-            "retrieval_count": note.retrieval_count,
-            "timestamp": note.timestamp,
-            "last_accessed": note.last_accessed,
-            "context": note.context,
-            "evolution_history": note.evolution_history,
-            "category": note.category,
-            "tags": note.tags
+            "tags": note.tags,
+            "contextual_description": note.context, # Assuming MemoryNote.context is the contextual_description
+            "linked_notes_ids": [link_id for link_id in note.links if isinstance(link_id, str)], # Assuming links are a list of IDs
+            "creation_timestamp": note.timestamp, # Ensure Qdrant compatible format if strict
+            "last_updated_timestamp": note.last_accessed, # Ensure Qdrant compatible format
+            # "source_document_uri": kwargs.get("source_document_uri"), # If provided in **kwargs
+            # For image_references, we need to structure it as per STP Table 2.
+            # Assuming **kwargs might contain 'image_references' as List[Dict]
+            # e.g., [{"image_uri": "...", "vlm_description": "..."}]
+            "image_references": kwargs.get("image_references", []) 
         }
-        self.retriever.add_document(note.content, metadata, note.id)
+        # Add any other relevant fields from note or kwargs to qdrant_payload
+        for key, value in kwargs.items():
+            if key not in qdrant_payload and key not in ['timestamp']: # Avoid overwriting existing or handled fields
+                qdrant_payload[key] = value
         
+        # Add to Qdrant using the retriever, passing the optional vector
+        # The 'document' argument to add_document is used for embedding if 'vector' is None.
+        self.retriever.add_document(document=note.content, metadata=qdrant_payload, doc_id=note.id, vector=vector)
+
         if evo_label == True:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
                 self.consolidate_memories()
         return note.id
-    
+
+    def add_notes_batch(self, notes_data: List[Dict[str, Any]]) -> List[str]:
+        """Add a batch of memory notes.
+
+        Args:
+            notes_data (List[Dict[str, Any]]): A list of dictionaries, where each dictionary
+                                              contains data for a memory note. Each dictionary
+                                              must include 'content' (str) and can optionally
+                                              include 'id' (str), 'time' (str), 'vector' (List[float]),
+                                              and other MemoryNote attributes.
+
+        Returns:
+            List[str]: A list of IDs for the newly added memory notes.
+        """
+        notes_to_process = []
+        processed_note_ids = []
+
+        for item_data in notes_data:
+            content = item_data.get('content')
+            if content is None:
+                logger.warning(f"Skipping item in batch due to missing 'content': {item_data}")
+                continue
+
+            # Extract arguments for MemoryNote constructor
+            mn_id = item_data.get('id')
+            mn_keywords = item_data.get('keywords')
+            mn_links = item_data.get('links') # MemoryNote expects 'links', payload might have 'linked_notes_ids'
+            mn_retrieval_count = item_data.get('retrieval_count')
+            mn_timestamp = item_data.get('time') # 'time' key from ingest_into_amem_tool's item_for_batch
+            mn_last_accessed = item_data.get('last_accessed')
+            # 'contextual_description' from payload should map to 'context' for MemoryNote
+            mn_context = item_data.get('contextual_description', item_data.get('context')) 
+            mn_evolution_history = item_data.get('evolution_history')
+            mn_category = item_data.get('category')
+            mn_tags = item_data.get('tags')
+            
+            vector = item_data.get('vector')
+
+            # Create MemoryNote object with only its defined parameters
+            note = MemoryNote(
+                content=content, 
+                id=mn_id,
+                keywords=mn_keywords,
+                links=mn_links,
+                retrieval_count=mn_retrieval_count,
+                timestamp=mn_timestamp,
+                last_accessed=mn_last_accessed,
+                context=mn_context,
+                evolution_history=mn_evolution_history,
+                category=mn_category,
+                tags=mn_tags
+            )
+
+            # Process memory for potential evolution (this might update note attributes)
+            evo_label, note = self.process_memory(note)
+            self.memories[note.id] = note # Add to in-memory store
+
+            # Prepare the rich Qdrant payload. Start with all data from item_data (which includes the original payload)
+            # and then ensure critical/standardized fields from the 'note' object are present.
+            qdrant_payload_for_item = item_data.copy() # Start with everything from item_for_batch
+            
+            # Ensure essential fields from the processed 'note' object are in the payload,
+            # potentially overwriting if MemoryNote processing changed them (e.g., generated ID, default timestamp).
+            qdrant_payload_for_item["note_id"] = note.id # Use the (potentially generated) ID from MemoryNote
+            qdrant_payload_for_item["content_text"] = note.content # Use content from MemoryNote
+            qdrant_payload_for_item["keywords"] = note.keywords
+            qdrant_payload_for_item["tags"] = note.tags
+            qdrant_payload_for_item["contextual_description"] = note.context # Standardized field name
+            qdrant_payload_for_item["creation_timestamp"] = note.timestamp
+            qdrant_payload_for_item["last_updated_timestamp"] = note.last_accessed
+            
+            # Remove keys that are not part of the Qdrant payload itself but were used for MemoryNote creation or are redundant
+            qdrant_payload_for_item.pop('content', None) # 'content' was for MemoryNote, Qdrant payload uses 'content_text'
+            qdrant_payload_for_item.pop('id', None)      # 'id' was for MemoryNote, Qdrant payload uses 'note_id'
+            qdrant_payload_for_item.pop('vector', None)  # 'vector' is handled separately by QdrantRetriever
+            qdrant_payload_for_item.pop('time', None)    # 'time' was mapped to 'timestamp' for MemoryNote
+
+            # 'image_references', 'source_uri', 'agent_id' etc. from the original payload in item_data will be preserved.
+
+            notes_to_process.append({
+                'document': note.content, # Text used for embedding if vector is None
+                'metadata': qdrant_payload_for_item, # The rich payload
+                'doc_id': note.id, # Qdrant point ID
+                'vector': vector 
+            })
+            processed_note_ids.append(note.id)
+
+            if evo_label:
+                 self.evo_cnt += 1
+
+        # Perform batch upsert to Qdrant
+        if notes_to_process:
+            self.retriever.add_documents_batch(notes_to_process)
+
+        # Check for consolidation after the batch
+        if self.evo_cnt >= self.evo_threshold:
+             self.consolidate_memories()
+             self.evo_cnt = 0 # Reset evolution counter after consolidation
+
+        return processed_note_ids
+
     def consolidate_memories(self):
         """Consolidate memories: update retriever with new documents"""
-        # Reset Qdrant collection (QdrantRetriever handles this on init or via a dedicated method if needed)
-        # For now, we assume QdrantRetriever's init ensures a clean state or we add a reset method to it.
-        # Re-initializing the retriever might be one way if a full reset is needed.
+        # Reset Qdrant collection
         self.retriever = QdrantRetriever(
             qdrant_host=self.qdrant_host,
             qdrant_port=self.qdrant_port,
-            collection_name="memories",
-            embedding_model_name=self.embedding_model_name_ams, 
+            collection_name=self.collection_name,
+            embedding_model_name=self.embedding_model_name_ams,
             qdrant_api_key=self.qdrant_api_key
         )
-        # Re-add all memory documents with their complete metadata
+        # Re-add all memory documents with their complete metadata using batch add
+        all_memories_data = []
         for memory in self.memories.values():
             metadata = {
                 "id": memory.id,
@@ -303,364 +484,93 @@ class AgenticMemorySystem:
                 "category": memory.category,
                 "tags": memory.tags
             }
-            self.retriever.add_document(memory.content, metadata, memory.id)
-    
-    def find_related_memories(self, query: str, k: int = 5) -> Tuple[str, List[int]]:
-        """Find related memories using ChromaDB retrieval"""
+            all_memories_data.append({
+                'document': memory.content,
+                'metadata': metadata,
+                'doc_id': memory.id,
+                'vector': None 
+            })
+        if all_memories_data:
+            self.retriever.add_documents_batch(all_memories_data)
+
+    def find_related_memories(self, query: str, k: int = 5, filters: Optional[Any] = None) -> Tuple[str, List[int]]:
+        """Find related memories using Qdrant retrieval.
+
+        Args:
+            query (str): The text to search for.
+            k (int): The maximum number of results to return.
+            filters (Optional[Any], optional): Qdrant filter conditions. Defaults to None.
+
+        Returns:
+            Tuple[str, List[int]]: A tuple containing:
+                - str: A formatted string of the retrieved memory contents and metadata.
+                - List[int]: A list of indices corresponding to the order of memories in the formatted string.
+        """
         if not self.memories:
             return "", []
-            
+
         try:
-            # Get results from ChromaDB
-            results = self.retriever.search(query, k)
-            
+            # Get results from QdrantRetriever, passing filters
+            results = self.retriever.search(query_text=query, k=k, filters=filters)
+
             # Convert to list of memories
             memory_str = ""
-            indices = []
-            
-            if 'ids' in results and results['ids'] and len(results['ids']) > 0 and len(results['ids'][0]) > 0:
-                for i, doc_id in enumerate(results['ids'][0]):
-                    # Get metadata from ChromaDB results
-                    if i < len(results['metadatas'][0]):
-                        metadata = results['metadatas'][0][i]
-                        # Format memory string
-                        memory_str += f"memory index:{i}\ttalk start time:{metadata.get('timestamp', '')}\tmemory content: {metadata.get('content', '')}\tmemory context: {metadata.get('context', '')}\tmemory keywords: {str(metadata.get('keywords', []))}\tmemory tags: {str(metadata.get('tags', []))}\n"
-                        indices.append(i)
-                    
+            indices = [] # Indices will correspond to the order in the formatted string
+
+            # The new self.retriever.search returns List[Dict[str, Any]]
+            # Each dict has 'id', 'score', 'payload'
+            # 'payload' contains the rich metadata stored in Qdrant.
+            if results:
+                for i, hit in enumerate(results): # results is now a list of hits
+                    payload = hit.get('payload', {})
+                    # Format memory string using data from payload
+                    memory_str += f"memory index:{i}\ttalk start time:{payload.get('creation_timestamp', '')}\tmemory content: {payload.get('content_text', '')}\tmemory context: {payload.get('contextual_description', '')}\tmemory keywords: {str(payload.get('keywords', []))}\tmemory tags: {str(payload.get('tags', []))}\n"
+                    indices.append(i) # Store the simple index
             return memory_str, indices
         except Exception as e:
             logger.error(f"Error in find_related_memories: {str(e)}")
             return "", []
 
-    def find_related_memories_raw(self, query: str, k: int = 5) -> str:
-        """Find related memories using ChromaDB retrieval in raw format"""
-        if not self.memories:
-            return ""
-            
-        # Get results from ChromaDB
-        results = self.retriever.search(query, k)
-        
-        # Convert to list of memories
-        memory_str = ""
-        
-        if 'ids' in results and results['ids'] and len(results['ids']) > 0:
-            for i, doc_id in enumerate(results['ids'][0][:k]):
-                if i < len(results['metadatas'][0]):
-                    # Get metadata from ChromaDB results
-                    metadata = results['metadatas'][0][i]
-                    
-                    # Add main memory info
-                    memory_str += f"talk start time:{metadata.get('timestamp', '')}\tmemory content: {metadata.get('content', '')}\tmemory context: {metadata.get('context', '')}\tmemory keywords: {str(metadata.get('keywords', []))}\tmemory tags: {str(metadata.get('tags', []))}\n"
-                    
-                    # Add linked memories if available
-                    links = metadata.get('links', [])
-                    j = 0
-                    for link_id in links:
-                        if link_id in self.memories and j < k:
-                            neighbor = self.memories[link_id]
-                            memory_str += f"talk start time:{neighbor.timestamp}\tmemory content: {neighbor.content}\tmemory context: {neighbor.context}\tmemory keywords: {str(neighbor.keywords)}\tmemory tags: {str(neighbor.tags)}\n"
-                            j += 1
-                            
-        return memory_str
-
-    def read(self, memory_id: str) -> Optional[MemoryNote]:
-        """Retrieve a memory note by its ID.
-        
-        Args:
-            memory_id (str): ID of the memory to retrieve
-            
-        Returns:
-            MemoryNote if found, None otherwise
+    def search_agentic(self, query: str, k: int = 5, filters: Optional[Any] = None) -> List[Dict[str, Any]]:
+        """Search for memories using Qdrant retrieval.
+           The 'filters' argument here is expected to be in the Qdrant `models.Filter` format
+           if passed directly to `self.retriever.search`. If it's a dict, it needs translation.
+           For simplicity, assuming `filters` is already a Qdrant `models.Filter` or None.
         """
-        return self.memories.get(memory_id)
-    
-    def update(self, memory_id: str, **kwargs) -> bool:
-        """Update a memory note.
-        
-        Args:
-            memory_id: ID of memory to update
-            **kwargs: Fields to update
-            
-        Returns:
-            bool: True if update successful
-        """
-        if memory_id not in self.memories:
-            return False
-            
-        note = self.memories[memory_id]
-        
-        # Update fields
-        for key, value in kwargs.items():
-            if hasattr(note, key):
-                setattr(note, key, value)
-                
-        # Update in ChromaDB
-        metadata = {
-            "id": note.id,
-            "content": note.content,
-            "keywords": note.keywords,
-            "links": note.links,
-            "retrieval_count": note.retrieval_count,
-            "timestamp": note.timestamp,
-            "last_accessed": note.last_accessed,
-            "context": note.context,
-            "evolution_history": note.evolution_history,
-            "category": note.category,
-            "tags": note.tags
-        }
-        
-        # Delete and re-add to update
-        self.retriever.delete_document(memory_id)
-        self.retriever.add_document(document=note.content, metadata=metadata, doc_id=memory_id)
-        
-        return True
-    
-    def delete(self, memory_id: str) -> bool:
-        """Delete a memory note by its ID.
-        
-        Args:
-            memory_id (str): ID of the memory to delete
-            
-        Returns:
-            bool: True if memory was deleted, False if not found
-        """
-        if memory_id in self.memories:
-            # Delete from ChromaDB
-            self.retriever.delete_document(memory_id)
-            # Delete from local storage
-            del self.memories[memory_id]
-            return True
-        return False
-    
-    def _search_raw(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Internal search method that returns raw results from ChromaDB.
-        
-        This is used internally by the memory evolution system to find
-        related memories for potential evolution.
-        
-        Args:
-            query (str): The search query text
-            k (int): Maximum number of results to return
-            
-        Returns:
-            List[Dict[str, Any]]: Raw search results from ChromaDB
-        """
-        results = self.retriever.search(query, k)
-        return [{'id': doc_id, 'score': score} 
-                for doc_id, score in zip(results['ids'][0], results['distances'][0])]
-                
-    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for memories using a hybrid retrieval approach.
-        
-        This method combines results from both:
-        1. ChromaDB vector store (semantic similarity)
-        2. Embedding-based retrieval (dense vectors)
-        
-        The results are deduplicated and ranked by relevance.
-        
-        Args:
-            query (str): The search query text
-            k (int): Maximum number of results to return
-            
-        Returns:
-            List[Dict[str, Any]]: List of search results, each containing:
-                - id: Memory ID
-                - content: Memory content
-                - score: Similarity score
-                - metadata: Additional memory metadata
-        """
-        # Get results from ChromaDB
-        chroma_results = self.retriever.search(query, k)
-        memories = []
-        
-        # Process ChromaDB results
-        for i, doc_id in enumerate(chroma_results['ids'][0]):
-            memory = self.memories.get(doc_id)
-            if memory:
-                memories.append({
-                    'id': doc_id,
-                    'content': memory.content,
-                    'context': memory.context,
-                    'keywords': memory.keywords,
-                    'score': chroma_results['distances'][0][i]
-                })
-                
-        # Get results from embedding retriever
-        indices = self.retriever.search(query, k) # This line seems problematic, search returns a dict not indices
-        
-        # Combine results with deduplication
-        seen_ids = set(m['id'] for m in memories)
-        # The following loop logic seems to assume 'indices' is a list of direct memory IDs or simple structures
-        # This part needs to be re-evaluated based on QdrantRetriever's actual search output
-        # For now, commenting out the potentially problematic part as it was based on a different retriever type
-        # for idx in indices: 
-        #     document = self.retriever.documents[idx] # QdrantRetriever does not have self.documents
-        #     memory_id = self.retriever.documents.index(document)
-        #     if document and document not in seen_ids:
-        #         memory = self.memories.get(memory_id)
-        #         if memory:
-        #             memories.append({
-        #                 'id': idx,
-        #                 'content': document,
-        #                 'context': memory.context,
-        #                 'keywords': memory.keywords,
-        #                 'score': result.get('score', 0.0) # 'result' is not defined here
-        #             })
-        #             seen_ids.add(memory_id)
-                    
-        return memories[:k]
-    
-    def _search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for memories using a hybrid retrieval approach.
-        
-        This method combines results from both:
-        1. ChromaDB vector store (semantic similarity)
-        2. Embedding-based retrieval (dense vectors)
-        
-        The results are deduplicated and ranked by relevance.
-        
-        Args:
-            query (str): The search query text
-            k (int): Maximum number of results to return
-            
-        Returns:
-            List[Dict[str, Any]]: List of search results, each containing:
-                - id: Memory ID
-                - content: Memory content
-                - score: Similarity score
-                - metadata: Additional memory metadata
-        """
-        # Get results from ChromaDB
-        chroma_results = self.retriever.search(query, k)
-        memories = []
-        
-        # Process ChromaDB results
-        for i, doc_id in enumerate(chroma_results['ids'][0]):
-            memory = self.memories.get(doc_id)
-            if memory:
-                memories.append({
-                    'id': doc_id,
-                    'content': memory.content,
-                    'context': memory.context,
-                    'keywords': memory.keywords,
-                    'score': chroma_results['distances'][0][i]
-                })
-                
-        # Get results from embedding retriever
-        embedding_results = self.retriever.search(query, k) # This also needs to be adapted if it was for a different retriever
-        
-        # Combine results with deduplication
-        seen_ids = set(m['id'] for m in memories)
-        # This loop also needs re-evaluation
-        # for result in embedding_results: 
-        #     memory_id = result.get('id')
-        #     if memory_id and memory_id not in seen_ids:
-        #         memory = self.memories.get(memory_id)
-        #         if memory:
-        #             memories.append({
-        #                 'id': memory_id,
-        #                 'content': memory.content,
-        #                 'context': memory.context,
-        #                 'keywords': memory.keywords,
-        #                 'score': result.get('score', 0.0)
-        #             })
-        #             seen_ids.add(memory_id)
-                    
-        return memories[:k]
-
-    def search_agentic(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for memories using ChromaDB retrieval."""
-        if not self.memories:
+        if not self.memories and not self.retriever: # Check if retriever is available
+            logger.warning("No memories or retriever available for search_agentic.")
             return []
             
         try:
-            # Get results from ChromaDB
-            results = self.retriever.search(query, k) # This now calls QdrantRetriever.search
+            # Get results from QdrantRetriever.
+            # The `filters` argument for `self.retriever.search` expects a qdrant_models.Filter object.
+            # If `filters` passed to `search_agentic` is a dict, it needs translation.
+            # For now, assuming it's passed correctly or is None.
+            qdrant_search_results = self.retriever.search(query_text=query, k=k, filters=filters)
             
-            # Process results
-            processed_memories = [] # Renamed to avoid confusion with self.memories
-            seen_ids = set()
+            # Process Qdrant search results (List[Dict[str, Any]])
+            # Each dict in qdrant_search_results has 'id', 'score', 'payload'
+            processed_memories = []
+            if qdrant_search_results:
+                for hit in qdrant_search_results:
+                    payload = hit.get('payload', {})
+                    memory_dict = {
+                        'id': hit.get('id'), # This is the Qdrant point ID, should match note_id
+                        'content': payload.get('content_text', ''), # Main text content
+                        'context': payload.get('contextual_description', ''),
+                        'keywords': payload.get('keywords', []),
+                        'tags': payload.get('tags', []),
+                        'timestamp': payload.get('creation_timestamp', ''),
+                        'category': payload.get('category', 'Uncategorized'), # If 'category' is in payload
+                        'score': hit.get('score'),
+                        'is_neighbor': False, # This field might be specific to how results are used later
+                        'image_references': payload.get('image_references', []) # Retrieve image_references
+                        # Add other fields from payload as needed by the application
+                    }
+                    processed_memories.append(memory_dict)
             
-            # Check if we have valid results from QdrantRetriever.search
-            if not (results and results.get('ids') and results['ids'][0] and \
-                    results.get('metadatas') and results['metadatas'][0] and \
-                    results.get('distances') and results['distances'][0]):
-                return []
-                
-            # Process QdrantRetriever results
-            res_ids = results['ids'][0]
-            res_metadatas = results['metadatas'][0]
-            res_scores = results['distances'][0]
-
-            for i, doc_id in enumerate(res_ids[:k]):
-                if doc_id in seen_ids:
-                    continue
-                
-                # QdrantRetriever's payload (now in res_metadatas[i]) contains the full note metadata
-                metadata = res_metadatas[i] 
-                
-                # Create result dictionary with all metadata fields
-                memory_dict = {
-                    'id': doc_id,
-                    'content': metadata.get('content', ''), # Assuming 'content' is in payload
-                    'context': metadata.get('context', ''),
-                    'keywords': metadata.get('keywords', []),
-                    'tags': metadata.get('tags', []),
-                    'timestamp': metadata.get('timestamp', ''),
-                    'category': metadata.get('category', 'Uncategorized'),
-                    'score': res_scores[i], # Qdrant score
-                    'is_neighbor': False
-                }
-                processed_memories.append(memory_dict)
-                seen_ids.add(doc_id)
+            return processed_memories # Already sliced to k by retriever.search
             
-            # Add linked memories (neighbors)
-            # This part needs to access self.memories (the in-memory dict of MemoryNote objects)
-            # The 'links' should be in the metadata (payload) from Qdrant
-            neighbor_count = 0
-            for memory_data_from_search in list(processed_memories): 
-                if neighbor_count >= k: # Overall limit for main + neighbor results
-                    break
-                
-                # Get links from the payload retrieved from Qdrant
-                # The payload is already in memory_data_from_search['payload'] if QdrantRetriever puts it there.
-                # However, search_agentic structures its items directly.
-                # The 'links' field should be part of the metadata stored in Qdrant.
-                # Let's assume 'links' is in the metadata (payload) from Qdrant.
-                
-                # We need the original MemoryNote object to get its links, or ensure links are in Qdrant payload.
-                # The metadata dict from Qdrant should contain 'links'.
-                links_in_payload = []
-                original_note_metadata = None
-                for i, res_id_val in enumerate(res_ids):
-                    if res_id_val == memory_data_from_search['id']:
-                        original_note_metadata = res_metadatas[i]
-                        break
-                
-                if original_note_metadata:
-                    links_in_payload = original_note_metadata.get('links', [])
-
-                for link_id in links_in_payload:
-                    if link_id not in seen_ids and neighbor_count < k:
-                        neighbor_note_object = self.memories.get(link_id) # Get MemoryNote from in-memory store
-                        if neighbor_note_object:
-                            processed_memories.append({
-                                'id': link_id,
-                                'content': neighbor_note_object.content,
-                                'context': neighbor_note_object.context,
-                                'keywords': neighbor_note_object.keywords,
-                                'tags': neighbor_note_object.tags,
-                                'timestamp': neighbor_note_object.timestamp,
-                                'category': neighbor_note_object.category,
-                                'is_neighbor': True
-                                # Score for neighbors is not directly available from primary search
-                            })
-                            seen_ids.add(link_id)
-                            neighbor_count += 1 # This counts how many neighbors are added in total
-                # This logic might add more than k items if k neighbors are added for *each* primary result.
-                # The final slicing `[:k]` should handle the overall limit.
-            
-            return processed_memories[:k]
         except Exception as e:
             logger.error(f"Error in search_agentic: {str(e)}")
             return []
@@ -684,120 +594,8 @@ class AgenticMemorySystem:
             if not neighbors_text or not indices:
                 return False, note
                 
-            # Format neighbors for LLM - in this case, neighbors_text is already formatted
-            
-            # Query LLM for evolution decision
-            prompt = self._evolution_system_prompt.format(
-                content=note.content,
-                context=note.context,
-                keywords=note.keywords,
-                nearest_neighbors_memories=neighbors_text,
-                neighbor_number=len(indices)
-            )
-            
-            try:
-                response = self.llm_controller.llm.get_completion(
-                    prompt,
-                    response_format={"type": "json_schema", "json_schema": {
-                        "name": "response",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "should_evolve": {
-                                    "type": "boolean"
-                                },
-                                "actions": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "suggested_connections": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "new_context_neighborhood": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "tags_to_update": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "new_tags_neighborhood": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string"
-                                        }
-                                    }
-                                }
-                            },
-                            "required": ["should_evolve", "actions", "suggested_connections", 
-                                      "tags_to_update", "new_context_neighborhood", "new_tags_neighborhood"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }}
-                )
-                
-                response_json = json.loads(response)
-                should_evolve = response_json["should_evolve"]
-                
-                if should_evolve:
-                    actions = response_json["actions"]
-                    for action in actions:
-                        if action == "strengthen":
-                            suggest_connections = response_json["suggested_connections"]
-                            new_tags = response_json["tags_to_update"]
-                            note.links.extend(suggest_connections)
-                            note.tags = new_tags
-                        elif action == "update_neighbor":
-                            new_context_neighborhood = response_json["new_context_neighborhood"]
-                            new_tags_neighborhood = response_json["new_tags_neighborhood"]
-                            noteslist = list(self.memories.values())
-                            notes_id = list(self.memories.keys())
-                            
-                            for i in range(min(len(indices), len(new_tags_neighborhood))):
-                                # Skip if we don't have enough neighbors
-                                if i >= len(indices):
-                                    continue
-                                    
-                                tag = new_tags_neighborhood[i]
-                                if i < len(new_context_neighborhood):
-                                    context = new_context_neighborhood[i]
-                                else:
-                                    # Since indices are just numbers now, we need to find the memory
-                                    # In memory list using its index number
-                                    if i < len(noteslist):
-                                        context = noteslist[i].context
-                                    else:
-                                        continue
-                                        
-                                # Get index from the indices list
-                                if i < len(indices):
-                                    memorytmp_idx = indices[i]
-                                    # Make sure the index is valid
-                                    if memorytmp_idx < len(noteslist):
-                                        notetmp = noteslist[memorytmp_idx]
-                                        notetmp.tags = tag
-                                        notetmp.context = context
-                                        # Make sure the index is valid
-                                        if memorytmp_idx < len(notes_id):
-                                            self.memories[notes_id[memorytmp_idx]] = notetmp
-                                
-                return should_evolve, note
-                
-            except (json.JSONDecodeError, KeyError, Exception) as e:
-                logger.error(f"Error in memory evolution: {str(e)}")
-                return False, note
+            # Mock evolution decision for PoC
+            return False, note
                 
         except Exception as e:
             # For testing purposes, catch all exceptions and return the original note

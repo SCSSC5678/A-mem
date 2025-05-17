@@ -1,6 +1,10 @@
 from typing import Dict, Optional, Literal, Any
 import os
 import json
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 from abc import ABC, abstractmethod
 from litellm import completion
 
